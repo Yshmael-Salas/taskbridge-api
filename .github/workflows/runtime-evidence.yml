@@ -1,0 +1,124 @@
+name: runtime-evidence
+
+on:
+  push:
+    paths:
+      - '**.sql'
+      - '.github/**'
+      - 'migrations/**'
+      - 'tests/**'
+  workflow_dispatch: {}
+
+env:
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: password
+  POSTGRES_DB: taskbridge
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U ${{ env.POSTGRES_USER }}"
+          --health-interval=5s
+          --health-timeout=2s
+          --health-retries=20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install psql client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..60}; do
+            if pg_isready -h localhost -p 5432 -U $POSTGRES_USER; then
+              echo "Postgres is ready" && break
+            fi
+            sleep 1
+          done
+
+      - name: Create database if missing
+        run: |
+          psql -h localhost -U $POSTGRES_USER -tc "SELECT 1 FROM pg_database WHERE datname = '$POSTGRES_DB'" | grep -q 1 || \
+          psql -h localhost -U $POSTGRES_USER -c "CREATE DATABASE $POSTGRES_DB;"
+
+      - name: Apply migrations (if any)
+        run: |
+          echo "MIGRATIONS_APPLIED=" > migrations-applied.txt
+          if [ -d migrations ]; then
+            for f in migrations/*.sql; do
+              if [ -f "$f" ]; then
+                echo "Applying $f" | tee -a migrations-applied.txt
+                psql -h localhost -U $POSTGRES_USER -d $POSTGRES_DB -f "$f" 2>&1 | tee -a migrations-applied.txt || true
+              fi
+            done
+          else
+            echo "No migrations directory found" | tee -a migrations-applied.txt
+          fi
+
+      - name: Seed data (if tests/seeds exist)
+        run: |
+          echo "SEED_OUTPUT=" > seed-output.txt
+          if [ -f tests/seeds.sql ]; then
+            psql -h localhost -U $POSTGRES_USER -d $POSTGRES_DB -f tests/seeds.sql 2>&1 | tee -a seed-output.txt || true
+          else
+            echo "No tests/seeds.sql found" | tee -a seed-output.txt
+          fi
+
+      - name: Run demo SQL (if present)
+        run: |
+          echo "DEMO_OUTPUT=" > runtime-output.txt
+          echo "Commit: $GITHUB_SHA" > runtime-metadata.txt
+          echo "Runner: $RUNNER_OS" >> runtime-metadata.txt
+          echo "Postgres image: postgres:15" >> runtime-metadata.txt
+
+          if [ -f tests/run_demo.sql ]; then
+            psql -h localhost -U $POSTGRES_USER -d $POSTGRES_DB -f tests/run_demo.sql 2>&1 | tee -a runtime-output.txt || true
+          else
+            echo "No tests/run_demo.sql found; running a basic smoke test" | tee -a runtime-output.txt
+            psql -h localhost -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT current_database(), current_user, now();" 2>&1 | tee -a runtime-output.txt || true
+          fi
+
+      - name: Collect simple DB diagnostics
+        run: |
+          echo "pg_stat_activity snapshot" > pg_stat_activity.txt
+          psql -h localhost -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT pid, usename, application_name, client_addr, state, query FROM pg_stat_activity LIMIT 100;" 2>&1 | tee -a pg_stat_activity.txt || true
+
+          echo "pg_settings snapshot" > pg_settings.txt
+          psql -h localhost -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT name, setting FROM pg_settings WHERE name IN ('log_statement','logging_collector','log_directory');" 2>&1 | tee -a pg_settings.txt || true
+
+      - name: Optionally run EXPLAIN (if tests/explain.sql exists)
+        run: |
+          echo "EXPLAIN_OUTPUT=" > explain.txt
+          if [ -f tests/explain.sql ]; then
+            psql -h localhost -U $POSTGRES_USER -d $POSTGRES_DB -f tests/explain.sql 2>&1 | tee -a explain.txt || true
+          else
+            echo "No tests/explain.sql found" | tee -a explain.txt
+          fi
+
+      - name: Upload runtime evidence artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-evidence
+          path: |
+            runtime-output.txt
+            runtime-metadata.txt
+            migrations-applied.txt
+            seed-output.txt
+            pg_stat_activity.txt
+            pg_settings.txt
+            explain.txt
+          if-no-files-found: ignore
